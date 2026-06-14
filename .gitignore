@@ -1,0 +1,25 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.pyc
+
+# Virtual environment
+venv/
+.venv/
+
+# AI output
+alerts/
+alert.jpg
+logs/
+
+# YOLO cache/models (optional)
+runs/
+
+# VS Code
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db

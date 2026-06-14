@@ -1,0 +1,334 @@
+import os
+import cv2
+import time
+import logging
+import threading
+from datetime import datetime
+from pathlib import Path
+from urllib.parse import quote
+
+import requests
+from dotenv import load_dotenv
+from ultralytics import YOLO
+
+# ============================================================
+# PATHS
+# ============================================================
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+DATA_DIR = BASE_DIR / "data"
+ALERT_DIR = DATA_DIR / "alerts"
+LOG_DIR = BASE_DIR / "logs"
+MODEL_DIR = BASE_DIR / "models"
+
+ALERT_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging.basicConfig(
+    filename=str(LOG_DIR / "cctv.log"),
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+console = logging.StreamHandler()
+console.setLevel(logging.INFO)
+logging.getLogger().addHandler(console)
+
+# ============================================================
+# ENV
+# ============================================================
+
+load_dotenv(BASE_DIR / ".env")
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
+
+DVR_USER = os.getenv("DVR_USER", "admin")
+DVR_PASSWORD = os.getenv("DVR_PASSWORD")
+DVR_IP = os.getenv("DVR_IP")
+
+SUBTYPE = os.getenv("SUBTYPE", "1")
+
+CAMERA_COUNT = int(os.getenv("CAMERA_COUNT", "5"))
+
+ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "300"))
+CONFIDENCE_THRESHOLD = float(
+    os.getenv("CONFIDENCE_THRESHOLD", "0.50")
+)
+
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN missing")
+
+if not CHAT_ID:
+    raise ValueError("CHAT_ID missing")
+
+if not DVR_PASSWORD:
+    raise ValueError("DVR_PASSWORD missing")
+
+if not DVR_IP:
+    raise ValueError("DVR_IP missing")
+
+# ============================================================
+# CAMERAS
+# ============================================================
+
+CAMERAS = {}
+
+for channel in range(1, CAMERA_COUNT + 1):
+    CAMERAS[channel] = os.getenv(
+        f"CAMERA_{channel}_NAME",
+        f"Camera {channel}"
+    )
+
+for camera_name in CAMERAS.values():
+    (ALERT_DIR / camera_name).mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+# ============================================================
+# MODEL
+# ============================================================
+
+MODEL_PATH = MODEL_DIR / "yolov8n.pt"
+
+if not MODEL_PATH.exists():
+    raise FileNotFoundError(
+        f"Model not found: {MODEL_PATH}"
+    )
+
+logging.info("Loading YOLO model...")
+MODEL = YOLO(str(MODEL_PATH))
+logging.info("YOLO loaded")
+
+# ============================================================
+# TELEGRAM
+# ============================================================
+
+def send_telegram_alert(
+    camera_name: str,
+    image_path: Path,
+    people_count: int,
+):
+    timestamp = datetime.now().strftime(
+        "%Y-%m-%d %H:%M:%S"
+    )
+
+    message = (
+        f"🚨 CCTV ALERT\n\n"
+        f"Camera: {camera_name}\n"
+        f"People: {people_count}\n"
+        f"Time: {timestamp}"
+    )
+
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+            data={
+                "chat_id": CHAT_ID,
+                "text": message,
+            },
+            timeout=10,
+        )
+
+        with open(image_path, "rb") as photo:
+            requests.post(
+                f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
+                data={"chat_id": CHAT_ID},
+                files={"photo": photo},
+                timeout=30,
+            )
+
+        logging.info(
+            f"Telegram alert sent: {camera_name}"
+        )
+
+    except Exception as ex:
+        logging.error(
+            f"Telegram error [{camera_name}] : {ex}"
+        )
+
+# ============================================================
+# CAMERA WORKER
+# ============================================================
+
+def camera_worker(channel: int, camera_name: str):
+
+    encoded_password = quote(DVR_PASSWORD)
+
+    rtsp_url = (
+        f"rtsp://{DVR_USER}:{encoded_password}"
+        f"@{DVR_IP}:554/cam/realmonitor"
+        f"?channel={channel}&subtype={SUBTYPE}"
+    )
+
+    logging.info(
+        f"[{camera_name}] Connecting..."
+    )
+
+    cap = cv2.VideoCapture(rtsp_url)
+
+    last_alert_time = 0
+    frame_counter = 0
+
+    while True:
+
+        try:
+
+            if not cap.isOpened():
+
+                logging.warning(
+                    f"[{camera_name}] Reconnecting..."
+                )
+
+                cap.release()
+
+                time.sleep(2)
+
+                cap = cv2.VideoCapture(rtsp_url)
+
+                continue
+
+            ret, frame = cap.read()
+
+            if not ret:
+
+                logging.warning(
+                    f"[{camera_name}] Frame read failed"
+                )
+
+                cap.release()
+
+                time.sleep(2)
+
+                cap = cv2.VideoCapture(rtsp_url)
+
+                continue
+
+            frame_counter += 1
+
+            # Process every 5th frame
+            if frame_counter % 5 != 0:
+                continue
+
+            results = MODEL(
+                frame,
+                verbose=False,
+            )
+
+            people_count = 0
+
+            for result in results:
+
+                for box in result.boxes:
+
+                    class_id = int(box.cls[0])
+                    confidence = float(box.conf[0])
+
+                    if (
+                        class_id == 0
+                        and confidence
+                        >= CONFIDENCE_THRESHOLD
+                    ):
+                        people_count += 1
+
+            if people_count == 0:
+                continue
+
+            logging.info(
+                f"[{camera_name}] "
+                f"People detected: {people_count}"
+            )
+
+            current_time = time.time()
+
+            if (
+                current_time - last_alert_time
+                < ALERT_COOLDOWN
+            ):
+                continue
+
+            date_folder = datetime.now().strftime(
+                "%Y-%m-%d"
+            )
+
+            save_dir = (
+                ALERT_DIR
+                / camera_name
+                / date_folder
+            )
+
+            save_dir.mkdir(
+                parents=True,
+                exist_ok=True
+            )
+
+            filename = (
+                datetime.now().strftime(
+                    "%Y%m%d_%H%M%S"
+                )
+                + ".jpg"
+            )
+
+            image_path = save_dir / filename
+
+            cv2.imwrite(
+                str(image_path),
+                frame,
+            )
+
+            send_telegram_alert(
+                camera_name=camera_name,
+                image_path=image_path,
+                people_count=people_count,
+            )
+
+            last_alert_time = current_time
+
+        except Exception as ex:
+
+            logging.exception(
+                f"[{camera_name}] Error: {ex}"
+            )
+
+            time.sleep(5)
+
+# ============================================================
+# MAIN
+# ============================================================
+
+if __name__ == "__main__":
+
+    logging.info("=" * 60)
+    logging.info("CCTV AI MONITOR STARTING")
+    logging.info("=" * 60)
+
+    threads = []
+
+    for channel, camera_name in CAMERAS.items():
+
+        thread = threading.Thread(
+            target=camera_worker,
+            args=(
+                channel,
+                camera_name,
+            ),
+            daemon=True,
+        )
+
+        thread.start()
+
+        threads.append(thread)
+
+        logging.info(
+            f"Started thread: {camera_name}"
+        )
+
+    while True:
+        time.sleep(60)
