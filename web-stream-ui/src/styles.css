@@ -1,0 +1,5 @@
+body { font-family: Arial, sans-serif; padding: 20px; }
+.app input { width: 100%; padding: 8px; margin: 8px 0; box-sizing: border-box; }
+.stream-container { margin-top: 12px; border: 1px solid #ccc; padding: 8px; min-height: 240px; display: flex; align-items: center; justify-content: center; }
+.placeholder { color: #666; }
+video, img { max-width: 100%; height: auto; }
