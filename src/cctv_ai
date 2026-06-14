@@ -44,7 +44,7 @@ logging.getLogger().addHandler(console)
 # ENV
 # ============================================================
 
-load_dotenv(BASE_DIR / ".env")
+load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
@@ -52,45 +52,39 @@ CHAT_ID = os.getenv("CHAT_ID")
 DVR_USER = os.getenv("DVR_USER", "admin")
 DVR_PASSWORD = os.getenv("DVR_PASSWORD")
 DVR_IP = os.getenv("DVR_IP")
-
 SUBTYPE = os.getenv("SUBTYPE", "1")
 
-CAMERA_COUNT = int(os.getenv("CAMERA_COUNT", "5"))
-
 ALERT_COOLDOWN = int(os.getenv("ALERT_COOLDOWN", "300"))
-CONFIDENCE_THRESHOLD = float(
-    os.getenv("CONFIDENCE_THRESHOLD", "0.50")
-)
+CONFIDENCE_THRESHOLD = float(os.getenv("CONFIDENCE_THRESHOLD", "0.5"))
 
-if not BOT_TOKEN:
-    raise ValueError("BOT_TOKEN missing")
+if not BOT_TOKEN or not CHAT_ID:
+    raise ValueError("BOT_TOKEN / CHAT_ID missing")
 
-if not CHAT_ID:
-    raise ValueError("CHAT_ID missing")
-
-if not DVR_PASSWORD:
-    raise ValueError("DVR_PASSWORD missing")
-
-if not DVR_IP:
-    raise ValueError("DVR_IP missing")
+if not DVR_PASSWORD or not DVR_IP:
+    raise ValueError("DVR credentials missing")
 
 # ============================================================
-# CAMERAS
+# CAMERAS (FULL ENV CONTROL)
 # ============================================================
 
 CAMERAS = {}
 
-for channel in range(1, CAMERA_COUNT + 1):
-    CAMERAS[channel] = os.getenv(
-        f"CAMERA_{channel}_NAME",
-        f"Camera {channel}"
-    )
+i = 1
+while True:
+    channel = os.getenv(f"CAMERA_{i}_CHANNEL")
+    name = os.getenv(f"CAMERA_{i}_NAME")
 
-for camera_name in CAMERAS.values():
-    (ALERT_DIR / camera_name).mkdir(
-        parents=True,
-        exist_ok=True
-    )
+    if not channel or not name:
+        break
+
+    CAMERAS[int(channel)] = name
+
+    (ALERT_DIR / name).mkdir(parents=True, exist_ok=True)
+
+    i += 1
+
+if not CAMERAS:
+    raise ValueError("No cameras found in .env")
 
 # ============================================================
 # MODEL
@@ -99,41 +93,26 @@ for camera_name in CAMERAS.values():
 MODEL_PATH = MODEL_DIR / "yolov8n.pt"
 
 if not MODEL_PATH.exists():
-    raise FileNotFoundError(
-        f"Model not found: {MODEL_PATH}"
-    )
-
-logging.info("Loading YOLO model...")
-MODEL = YOLO(str(MODEL_PATH))
-logging.info("YOLO loaded")
+    raise FileNotFoundError(f"Model not found: {MODEL_PATH}")
 
 # ============================================================
 # TELEGRAM
 # ============================================================
 
-def send_telegram_alert(
-    camera_name: str,
-    image_path: Path,
-    people_count: int,
-):
-    timestamp = datetime.now().strftime(
-        "%Y-%m-%d %H:%M:%S"
-    )
-
-    message = (
-        f"🚨 CCTV ALERT\n\n"
-        f"Camera: {camera_name}\n"
-        f"People: {people_count}\n"
-        f"Time: {timestamp}"
-    )
-
+def send_telegram_alert(camera_name, image_path, people_count):
     try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        message = (
+            f"🚨 CCTV ALERT\n\n"
+            f"Camera: {camera_name}\n"
+            f"People: {people_count}\n"
+            f"Time: {timestamp}"
+        )
+
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={
-                "chat_id": CHAT_ID,
-                "text": message,
-            },
+            data={"chat_id": CHAT_ID, "text": message},
             timeout=10,
         )
 
@@ -145,20 +124,16 @@ def send_telegram_alert(
                 timeout=30,
             )
 
-        logging.info(
-            f"Telegram alert sent: {camera_name}"
-        )
-
-    except Exception as ex:
-        logging.error(
-            f"Telegram error [{camera_name}] : {ex}"
-        )
+    except Exception as e:
+        logging.error(f"Telegram error ({camera_name}): {e}")
 
 # ============================================================
 # CAMERA WORKER
 # ============================================================
 
-def camera_worker(channel: int, camera_name: str):
+def camera_worker(channel, camera_name):
+
+    model = YOLO(str(MODEL_PATH))  # thread-safe fix
 
     encoded_password = quote(DVR_PASSWORD)
 
@@ -168,135 +143,82 @@ def camera_worker(channel: int, camera_name: str):
         f"?channel={channel}&subtype={SUBTYPE}"
     )
 
-    logging.info(
-        f"[{camera_name}] Connecting..."
-    )
+    logging.info(f"[{camera_name}] Connecting...")
 
     cap = cv2.VideoCapture(rtsp_url)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     last_alert_time = 0
     frame_counter = 0
 
     while True:
-
         try:
-
             if not cap.isOpened():
-
-                logging.warning(
-                    f"[{camera_name}] Reconnecting..."
-                )
-
+                logging.warning(f"[{camera_name}] Reconnecting...")
                 cap.release()
-
                 time.sleep(2)
-
                 cap = cv2.VideoCapture(rtsp_url)
-
                 continue
 
             ret, frame = cap.read()
 
             if not ret:
-
-                logging.warning(
-                    f"[{camera_name}] Frame read failed"
-                )
-
+                logging.warning(f"[{camera_name}] Frame read failed")
                 cap.release()
-
                 time.sleep(2)
-
                 cap = cv2.VideoCapture(rtsp_url)
-
                 continue
 
             frame_counter += 1
 
-            # Process every 5th frame
             if frame_counter % 5 != 0:
                 continue
 
-            results = MODEL(
-                frame,
-                verbose=False,
-            )
+            # speed optimization
+            frame = cv2.resize(frame, (640, 360))
+
+            results = model(frame, verbose=False)
 
             people_count = 0
 
             for result in results:
-
                 for box in result.boxes:
+                    cls = int(box.cls[0])
+                    conf = float(box.conf[0])
 
-                    class_id = int(box.cls[0])
-                    confidence = float(box.conf[0])
-
-                    if (
-                        class_id == 0
-                        and confidence
-                        >= CONFIDENCE_THRESHOLD
-                    ):
+                    if cls == 0 and conf >= CONFIDENCE_THRESHOLD:
                         people_count += 1
 
             if people_count == 0:
                 continue
 
-            logging.info(
-                f"[{camera_name}] "
-                f"People detected: {people_count}"
-            )
+            logging.info(f"[{camera_name}] People detected: {people_count}")
 
-            current_time = time.time()
+            now = time.time()
 
-            if (
-                current_time - last_alert_time
-                < ALERT_COOLDOWN
-            ):
+            if now - last_alert_time < ALERT_COOLDOWN:
                 continue
 
-            date_folder = datetime.now().strftime(
-                "%Y-%m-%d"
-            )
+            date_folder = datetime.now().strftime("%Y-%m-%d")
 
-            save_dir = (
-                ALERT_DIR
-                / camera_name
-                / date_folder
-            )
+            save_dir = ALERT_DIR / camera_name / date_folder
+            save_dir.mkdir(parents=True, exist_ok=True)
 
-            save_dir.mkdir(
-                parents=True,
-                exist_ok=True
-            )
-
-            filename = (
-                datetime.now().strftime(
-                    "%Y%m%d_%H%M%S"
-                )
-                + ".jpg"
-            )
-
+            filename = datetime.now().strftime("%Y%m%d_%H%M%S") + ".jpg"
             image_path = save_dir / filename
 
-            cv2.imwrite(
-                str(image_path),
-                frame,
-            )
+            cv2.imwrite(str(image_path), frame)
 
-            send_telegram_alert(
-                camera_name=camera_name,
-                image_path=image_path,
-                people_count=people_count,
-            )
+            threading.Thread(
+                target=send_telegram_alert,
+                args=(camera_name, image_path, people_count),
+                daemon=True
+            ).start()
 
-            last_alert_time = current_time
+            last_alert_time = now
 
-        except Exception as ex:
-
-            logging.exception(
-                f"[{camera_name}] Error: {ex}"
-            )
-
+        except Exception as e:
+            logging.exception(f"[{camera_name}] Error: {e}")
             time.sleep(5)
 
 # ============================================================
@@ -306,29 +228,24 @@ def camera_worker(channel: int, camera_name: str):
 if __name__ == "__main__":
 
     logging.info("=" * 60)
-    logging.info("CCTV AI MONITOR STARTING")
+    logging.info("CCTV AI SYSTEM STARTING")
     logging.info("=" * 60)
 
     threads = []
 
-    for channel, camera_name in CAMERAS.items():
+    for channel, name in CAMERAS.items():
 
-        thread = threading.Thread(
+        t = threading.Thread(
             target=camera_worker,
-            args=(
-                channel,
-                camera_name,
-            ),
+            args=(channel, name),
             daemon=True,
+            name=f"cam-{channel}"
         )
 
-        thread.start()
+        t.start()
+        threads.append(t)
 
-        threads.append(thread)
-
-        logging.info(
-            f"Started thread: {camera_name}"
-        )
+        logging.info(f"Started: {name} (Channel {channel})")
 
     while True:
-        time.sleep(60)
+        time.sleep(float(os.getenv("ALERT_COOLDOWN", "60")))  
