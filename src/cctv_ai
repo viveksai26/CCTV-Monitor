@@ -3,7 +3,7 @@ import cv2
 import time
 import logging
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from urllib.parse import quote
 
@@ -231,6 +231,56 @@ if __name__ == "__main__":
     logging.info("CCTV AI SYSTEM STARTING")
     logging.info("=" * 60)
 
+    # Cleanup configuration
+    RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "30"))
+    CLEANUP_INTERVAL_HOURS = int(os.getenv("CLEANUP_INTERVAL_HOURS", "24"))
+
+    def cleanup_old_files():
+        cutoff = datetime.now() - timedelta(days=RETENTION_DAYS)
+        cutoff_ts = cutoff.timestamp()
+
+        try:
+            # Clean log files
+            for p in LOG_DIR.glob("**/*"):
+                try:
+                    if p.is_file():
+                        if p.stat().st_mtime < cutoff_ts:
+                            logging.info(f"Deleting old log file: {p}")
+                            p.unlink()
+                except Exception as e:
+                    logging.error(f"Error deleting log file {p}: {e}")
+
+            # Clean alert images and remove empty directories
+            for p in ALERT_DIR.glob("**/*"):
+                try:
+                    if p.is_file():
+                        if p.stat().st_mtime < cutoff_ts:
+                            logging.info(f"Deleting old alert file: {p}")
+                            p.unlink()
+                    elif p.is_dir():
+                        # attempt to remove empty directories
+                        try:
+                            if not any(p.iterdir()):
+                                logging.info(f"Removing empty directory: {p}")
+                                p.rmdir()
+                        except Exception:
+                            pass
+                except Exception as e:
+                    logging.error(f"Error deleting alert file/dir {p}: {e}")
+
+        except Exception as e:
+            logging.exception(f"Cleanup failed: {e}")
+
+    def cleanup_worker():
+        while True:
+            cleanup_old_files()
+            time.sleep(CLEANUP_INTERVAL_HOURS * 3600)
+
+    # Run cleanup once at startup and start periodic cleanup thread
+    cleanup_old_files()
+    t_cleanup = threading.Thread(target=cleanup_worker, daemon=True, name="cleanup")
+    t_cleanup.start()
+
     threads = []
 
     for channel, name in CAMERAS.items():
@@ -248,4 +298,4 @@ if __name__ == "__main__":
         logging.info(f"Started: {name} (Channel {channel})")
 
     while True:
-        time.sleep(float(os.getenv("ALERT_COOLDOWN", "60")))  
+        time.sleep(float(os.getenv("ALERT_COOLDOWN", "60")))
