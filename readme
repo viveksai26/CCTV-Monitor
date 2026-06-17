@@ -1,1 +1,15 @@
-.
+Flow
+CP Plus RTSP
+      ↓
+YOLO Person Detection
+      ↓
+Telegram Bot
+      ↓
+Message + Snapshot
+
+Install
+python -m pip install python-dotenv ultralytics opencv-python requests
+
+Steps
+Create a Telegram bot
+create a .env file and full all values
